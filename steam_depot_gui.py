@@ -23,6 +23,7 @@ SEARCH_DELAY_MS = 400
 STATUS_IDLE = "Idle"
 DEFAULT_LANGUAGE = "english"
 REMOTE_MANIFEST_URL_TEMPLATE = "https://github.com/qwe213312/k25FCdfEOoEJ42S6/raw/refs/heads/main/{depot}_{manifest}.manifest"
+STORE_APP_DETAILS_URL_TEMPLATE = "https://store.steampowered.com/api/appdetails?appids={appid}&l={language}"
 
 
 LUA_DEPOT_PATTERN = re.compile(r'addappid\(\s*(\d+)\s*,\s*\d+\s*,\s*"([^"]+)"\)', re.IGNORECASE)
@@ -51,6 +52,36 @@ def _format_vdf_value(value):
     text = str(value)
     text = text.replace("\\", "\\\\").replace('"', '\\"')
     return text
+
+
+def resolve_asset_path(filename):
+    candidates = []
+    asset_subpaths = [filename, f"assets/{filename}", f"resources/{filename}"]
+    try:
+        package_dir = Path(__file__).resolve().parent
+        for subpath in asset_subpaths:
+            candidates.append(package_dir / subpath)
+    except Exception:
+        pass
+    for subpath in asset_subpaths:
+        candidates.append(Path.cwd() / subpath)
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        for subpath in asset_subpaths:
+            candidates.append(Path(bundle_dir) / subpath)
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists():
+            return resolved
+    return None
 
 
 def dump_vdf(data, indent=0):
@@ -336,12 +367,14 @@ def detect_steam_path():
 
 
 def ensure_icon(root):
-    icon_path = Path("steam_icon.ico")
-    if icon_path.exists():
-        try:
-            root.iconbitmap(str(icon_path.resolve()))
-        except Exception:
-            pass
+    icon_path = resolve_asset_path("steam_icon.ico")
+    if not icon_path:
+        logger.warning("Application icon steam_icon.ico not found; using default Tk icon.")
+        return
+    try:
+        root.iconbitmap(str(icon_path))
+    except Exception as exc:
+        logger.warning("Failed to apply application icon at %s: %s", icon_path, exc)
 
 
 def hex_to_rgb(code):
@@ -1000,6 +1033,9 @@ class SteamDepotApp:
         self.steam_folder_var = tk.StringVar(value=str(steam_root))
         self.integrator = GreenLumaIntegrator(steam_root)
         self.latest_results = {}
+        self.app_name_cache = {}
+        self.search_entry = None
+        self.search_placeholder_active = False
         self.active_search = None
         self.setup_style()
         self.build_gui()
@@ -1279,6 +1315,14 @@ class SteamDepotApp:
         search_entry = ttk.Entry(right, textvariable=self.search_var, style="Search.TEntry")
         search_entry.grid(row=0, column=0, sticky="ew", pady=(4, 12))
         search_entry.bind("<KeyRelease>", self.on_search_change)
+        search_entry.bind("<KeyPress>", self.on_search_keypress)
+        self.search_entry = search_entry
+        self.search_placeholder = "Search by name or app ID"
+        self.search_placeholder_color = "#4f6b8c"
+        self.search_normal_color = "#e7f1ff"
+        self.apply_search_placeholder(search_entry, init=True)
+        search_entry.bind("<FocusIn>", self.on_search_focus_in)
+        search_entry.bind("<FocusOut>", self.on_search_focus_out)
         tree_frame_results = ttk.Frame(right, style="Panel.TFrame")
         tree_frame_results.grid(row=1, column=0, sticky="nsew")
         tree_frame_results.grid_columnconfigure(0, weight=1)
@@ -1331,16 +1375,79 @@ class SteamDepotApp:
             self.integrator = GreenLumaIntegrator(folder)
             messagebox.showinfo("Steam Folder", "Steam folder updated.", parent=self.root)
 
+    def apply_search_placeholder(self, entry_widget, init=False):
+        text = self.search_var.get()
+        if text and not self.search_placeholder_active:
+            entry_widget.configure(foreground=self.search_normal_color)
+            return
+        entry_widget.configure(foreground=self.search_placeholder_color)
+        self.search_placeholder_active = True
+        self.search_var.set(self.search_placeholder)
+        entry_widget.icursor(0)
+        if not init:
+            entry_widget.selection_clear()
+
+    def clear_search_placeholder(self, entry_widget):
+        if not self.search_placeholder_active:
+            return
+        self.search_placeholder_active = False
+        self.search_var.set("")
+        entry_widget.configure(foreground=self.search_normal_color)
+
+    def on_search_focus_in(self, event):
+        widget = event.widget
+        self.clear_search_placeholder(widget)
+
+    def on_search_focus_out(self, event):
+        widget = event.widget
+        if not self.search_var.get():
+            self.apply_search_placeholder(widget)
+
+    def on_search_keypress(self, event):
+        if self.search_placeholder_active:
+            self.clear_search_placeholder(event.widget)
+
+    def resolve_app_name(self, appid):
+        cached = self.app_name_cache.get(appid)
+        if cached:
+            return cached
+        url = STORE_APP_DETAILS_URL_TEMPLATE.format(appid=appid, language=DEFAULT_LANGUAGE)
+        try:
+            data = request_json(url)
+            entry = data.get(str(appid), {})
+            if entry.get("success"):
+                store_data = entry.get("data") or {}
+                name = (store_data.get("name") or "").strip()
+                if name:
+                    self.app_name_cache[appid] = name
+                    return name
+        except Exception as exc:
+            logger.warning("Failed to resolve app name for app id %s: %s", appid, exc)
+        fallback = f"App {appid}"
+        self.app_name_cache[appid] = fallback
+        return fallback
+
     def on_search_change(self, event=None):
+        widget = event.widget if event else None
+        if widget and self.search_placeholder_active:
+            return
         if self.search_after_id:
             self.root.after_cancel(self.search_after_id)
         self.search_after_id = self.root.after(SEARCH_DELAY_MS, self.start_search)
 
     def start_search(self):
-        query = self.search_var.get().strip()
+        raw_value = self.search_var.get()
+        if self.search_placeholder_active:
+            query = ""
+        else:
+            query = raw_value.strip()
         if not query:
+            if not self.search_placeholder_active:
+                self.search_var.set("")
             self.clear_results()
             self.status_var.set(STATUS_IDLE)
+            if self.search_entry:
+                self.apply_search_placeholder(self.search_entry)
             return
         if self.active_search:
             self.active_search = None
@@ -1351,15 +1458,10 @@ class SteamDepotApp:
 
     def search_worker(self, query):
         try:
-            logger.info("Searching for apps matching '%s'", query)
-            url = f"https://steamcommunity.com/actions/SearchApps/{urllib.parse.quote(query)}"
-            data = request_json(url)
             results = []
-            for entry in data:
-                appid = str(entry.get("appid", "")).strip()
-                name = entry.get("name", "").strip()
-                if not appid or not name:
-                    continue
+            normalized = query.strip()
+
+            def inspect_app(appid, name):
                 repos = []
                 for repo_id, repo in self.repo_objects.items():
                     try:
@@ -1389,6 +1491,23 @@ class SteamDepotApp:
                     )
                 else:
                     logger.info("No manifests found for app %s (%s)", appid, name)
+
+            if normalized.isdigit():
+                appid = normalized
+                name = self.resolve_app_name(appid)
+                logger.info("Searching repositories for app id %s (%s)", appid, name)
+                inspect_app(appid, name)
+            else:
+                logger.info("Searching for apps matching '%s'", normalized)
+                url = f"https://steamcommunity.com/actions/SearchApps/{urllib.parse.quote(normalized)}"
+                data = request_json(url)
+                for entry in data:
+                    appid = str(entry.get("appid", "")).strip()
+                    name = entry.get("name", "").strip()
+                    if not appid or not name:
+                        continue
+                    inspect_app(appid, name)
+
             self.queue.put(("search_results", query, results))
         except Exception as exc:
             logger.exception("Search failed for query '%s'", query)
@@ -1710,3 +1829,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
