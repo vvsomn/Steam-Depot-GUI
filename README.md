@@ -3,7 +3,7 @@
 Steam Depot GUI is a tool that finds, downloads, and adds Steam depot manifests into a GreenLuma-preconfigured Steam installation. It streamlines manifest hunting across community repositories, automates GreenLuma integration steps, and keeps your injected titles organized with a modern, status-rich interface.
 
 ## 🎥 Showcase
-[Simple usecase (MP4)](https://cdn.discordapp.com/attachments/712808939384995950/1433682846391865456/Steam_Depot_GUI.mp4?ex=690594b3&is=69044333&hm=55727300dc6a803bdb838fb71130a705b329729f453804635045b938bd033f2a&)
+![Steam Depot GUI demo](https://cdn.discordapp.com/attachments/712808939384995950/1433685650544001064/Steam_Depot_GUI.gif?ex=6905974f&is=690445cf&hm=b2026323e31d41372f8832bffc39ae3c8e811854afe7d8daee15093000358480&)
 
 ## Features
 - **Steam-wide search with offline caching:** Builds a local FTS5 index from the Steam API and SteamSpy so you can instantly search by name or app ID, even delisted games.
