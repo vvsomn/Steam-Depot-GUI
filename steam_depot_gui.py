@@ -1,12 +1,20 @@
+import atexit
 import logging
 import json
+import zipfile
+import math
 import os
 import queue
 import re
 import shutil
+import sqlite3
+import ctypes
+from ctypes import wintypes
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +32,11 @@ STATUS_IDLE = "Idle"
 DEFAULT_LANGUAGE = "english"
 REMOTE_MANIFEST_URL_TEMPLATE = "https://github.com/qwe213312/k25FCdfEOoEJ42S6/raw/refs/heads/main/{depot}_{manifest}.manifest"
 STORE_APP_DETAILS_URL_TEMPLATE = "https://store.steampowered.com/api/appdetails?appids={appid}&l={language}"
+STEAM_APPLIST_URL = "https://api.steampowered.com/ISteamApps/GetAppList/v2"
+STEAMSPY_ALL_URL = "https://steamspy.com/api.php?request=all"
+TTL_STEAM_SEARCH = 7 * 24 * 3600
+TTL_STEAMSPY = 24 * 3600
+STEAM_SEARCH_LIMIT = 5
 
 
 LUA_DEPOT_PATTERN = re.compile(r'addappid\(\s*(\d+)\s*,\s*\d+\s*,\s*"([^"]+)"\)', re.IGNORECASE)
@@ -142,6 +155,594 @@ def request_bytes(url):
     with urllib.request.urlopen(req, timeout=60) as resp:
         return resp.read()
 
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+    def __init__(self, guid_str=None):
+        super().__init__()
+        if guid_str:
+            parts = guid_str.strip("{}").split("-")
+            self.Data1 = int(parts[0], 16)
+            self.Data2 = int(parts[1], 16)
+            self.Data3 = int(parts[2], 16)
+            data4 = bytes.fromhex(parts[3] + parts[4])
+            for idx in range(8):
+                self.Data4[idx] = data4[idx]
+
+
+def guid_equal(lhs, rhs):
+    return (
+        lhs.Data1 == rhs.Data1
+        and lhs.Data2 == rhs.Data2
+        and lhs.Data3 == rhs.Data3
+        and bytes(lhs.Data4) == bytes(rhs.Data4)
+    )
+
+
+class FORMATETC(ctypes.Structure):
+    _fields_ = [
+        ("cfFormat", wintypes.UINT),
+        ("ptd", ctypes.c_void_p),
+        ("dwAspect", wintypes.DWORD),
+        ("lindex", ctypes.c_long),
+        ("tymed", wintypes.DWORD),
+    ]
+
+
+class STGMEDIUM_UNION(ctypes.Union):
+    _fields_ = [
+        ("hGlobal", wintypes.HGLOBAL),
+        ("pstm", ctypes.c_void_p),
+        ("pstg", ctypes.c_void_p),
+    ]
+
+
+class STGMEDIUM(ctypes.Structure):
+    _fields_ = [
+        ("tymed", wintypes.DWORD),
+        ("union", STGMEDIUM_UNION),
+        ("pUnkForRelease", ctypes.c_void_p),
+    ]
+
+
+HRESULT = wintypes.LONG
+DROPEFFECT_NONE = wintypes.DWORD(0)
+DROPEFFECT_COPY = wintypes.DWORD(1)
+CF_HDROP = 15
+TYMED_HGLOBAL = 1
+DVASPECT_CONTENT = 1
+E_NOINTERFACE = 0x80004002
+
+
+class IDataObjectVtbl(ctypes.Structure):
+    _fields_ = [
+        ("QueryInterface", ctypes.c_void_p),
+        ("AddRef", ctypes.c_void_p),
+        ("Release", ctypes.c_void_p),
+        ("GetData", ctypes.c_void_p),
+        ("GetDataHere", ctypes.c_void_p),
+        ("QueryGetData", ctypes.c_void_p),
+        ("GetCanonicalFormatEtc", ctypes.c_void_p),
+        ("SetData", ctypes.c_void_p),
+        ("EnumFormatEtc", ctypes.c_void_p),
+        ("DAdvise", ctypes.c_void_p),
+        ("DUnadvise", ctypes.c_void_p),
+        ("EnumDAdvise", ctypes.c_void_p),
+    ]
+
+
+class IDataObject(ctypes.Structure):
+    _fields_ = [
+        ("lpVtbl", ctypes.POINTER(IDataObjectVtbl)),
+    ]
+
+
+class IDropTargetVtbl(ctypes.Structure):
+    pass
+
+
+class IDropTarget(ctypes.Structure):
+    _fields_ = [
+        ("lpVtbl", ctypes.POINTER(IDropTargetVtbl)),
+    ]
+
+
+class DropTargetStruct(ctypes.Structure):
+    _fields_ = [
+        ("lpVtbl", ctypes.POINTER(IDropTargetVtbl)),
+        ("ref_count", ctypes.c_ulong),
+        ("py_object", ctypes.py_object),
+    ]
+
+
+class WindowsZipDropTarget:
+    IID_IUNKNOWN = GUID("00000000-0000-0000-C000-000000000046")
+    IID_IDROPTARGET = GUID("00000122-0000-0000-C000-000000000046")
+
+    def __init__(self, widget, event_queue):
+        self.widget = widget
+        self.queue = event_queue
+        self.shell32 = ctypes.windll.shell32
+        self.shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+        self.shell32.DragQueryFileW.restype = wintypes.UINT
+        self.shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        self.shell32.DragAcceptFiles.restype = None
+        self.ole32 = ctypes.windll.ole32
+        self.ole32.ReleaseStgMedium.argtypes = [ctypes.POINTER(STGMEDIUM)]
+        self.ole32.ReleaseStgMedium.restype = None
+        self._ole_initialized = False
+        self._register_ole()
+        self._create_vtable()
+        self._struct = DropTargetStruct(
+            ctypes.pointer(self._vtbl),
+            1,
+            ctypes.py_object(self),
+        )
+        self._drop_target = ctypes.pointer(self._struct)
+        hwnd = widget.winfo_id()
+        hr = self.ole32.RegisterDragDrop(wintypes.HWND(hwnd), ctypes.cast(self._drop_target, ctypes.POINTER(IDropTarget)))
+        if hr != 0:
+            raise ctypes.WinError(hr)
+        self.shell32.DragAcceptFiles(wintypes.HWND(hwnd), True)
+        self._current_files = []
+        self._has_zip = False
+
+    def _register_ole(self):
+        hr = self.ole32.OleInitialize(None)
+        if hr in (0, 1):  # S_OK or S_FALSE
+            self._ole_initialized = True
+
+    def _create_vtable(self):
+        QueryInterfaceProto = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p))
+        AddRefProto = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+        ReleaseProto = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+        DragEnterProto = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
+        DragOverProto = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD))
+        DragLeaveProto = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p)
+        DropProto = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p)
+
+        def get_self(this_ptr):
+            struct = ctypes.cast(this_ptr, ctypes.POINTER(DropTargetStruct)).contents
+            return struct.py_object
+
+        def qi(this_ptr, riid_ptr, out_ptr):
+            self_obj = get_self(this_ptr)
+            if guid_equal(riid_ptr.contents, self_obj.IID_IUNKNOWN) or guid_equal(riid_ptr.contents, self_obj.IID_IDROPTARGET):
+                out_ptr[0] = ctypes.cast(this_ptr, ctypes.c_void_p)
+                self_obj._add_ref()
+                return 0
+            out_ptr[0] = ctypes.c_void_p()
+            return HRESULT(E_NOINTERFACE)
+
+        def add_ref(this_ptr):
+            struct = ctypes.cast(this_ptr, ctypes.POINTER(DropTargetStruct)).contents
+            struct.ref_count += 1
+            return struct.ref_count
+
+        def release(this_ptr):
+            struct = ctypes.cast(this_ptr, ctypes.POINTER(DropTargetStruct)).contents
+            if struct.ref_count > 0:
+                struct.ref_count -= 1
+            return struct.ref_count
+
+        def drag_enter(this_ptr, data_obj_ptr, key_state, point, effect_ptr):
+            self_obj = get_self(this_ptr)
+            files = self_obj._extract_files(data_obj_ptr)
+            self_obj._current_files = files
+            self_obj._has_zip = any(path.lower().endswith(".zip") for path in files)
+            self_obj._post_event(("drop_hover", self_obj._has_zip))
+            effect_ptr[0] = DROPEFFECT_COPY if self_obj._has_zip else DROPEFFECT_NONE
+            return 0
+
+        def drag_over(this_ptr, key_state, point, effect_ptr):
+            self_obj = get_self(this_ptr)
+            effect_ptr[0] = DROPEFFECT_COPY if self_obj._has_zip else DROPEFFECT_NONE
+            return 0
+
+        def drag_leave(this_ptr):
+            self_obj = get_self(this_ptr)
+            self_obj._current_files = []
+            self_obj._has_zip = False
+            self_obj._post_event(("drop_hover", False))
+            return 0
+
+        def drop(this_ptr, data_obj_ptr, key_state, point):
+            self_obj = get_self(this_ptr)
+            files = self_obj._extract_files(data_obj_ptr)
+            zip_files = [str(path) for path in files if path.lower().endswith(".zip")]
+            self_obj._current_files = []
+            self_obj._has_zip = False
+            self_obj._post_event(("drop_hover", False))
+            if zip_files:
+                self_obj._post_event(("drop_zip", zip_files[0]))
+            else:
+                self_obj._post_event(("drop_zip", None))
+            return 0
+
+        self._qi = QueryInterfaceProto(qi)
+        self._addref = AddRefProto(add_ref)
+        self._release = ReleaseProto(release)
+        self._drag_enter = DragEnterProto(drag_enter)
+        self._drag_over = DragOverProto(drag_over)
+        self._drag_leave = DragLeaveProto(drag_leave)
+        self._drop = DropProto(drop)
+
+        IDropTargetVtbl._fields_ = [
+            ("QueryInterface", QueryInterfaceProto),
+            ("AddRef", AddRefProto),
+            ("Release", ReleaseProto),
+            ("DragEnter", DragEnterProto),
+            ("DragOver", DragOverProto),
+            ("DragLeave", DragLeaveProto),
+            ("Drop", DropProto),
+        ]
+        self._vtbl = IDropTargetVtbl(
+            self._qi,
+            self._addref,
+            self._release,
+            self._drag_enter,
+            self._drag_over,
+            self._drag_leave,
+            self._drop,
+        )
+
+    def _post_event(self, payload):
+        try:
+            self.queue.put_nowait(payload)
+        except Exception:
+            logger.exception("Failed to post drag-and-drop event")
+
+    def _add_ref(self):
+        struct = self._struct
+        struct.ref_count += 1
+        return struct.ref_count
+
+    def _extract_files(self, data_obj_ptr):
+        if not data_obj_ptr:
+            return []
+        data_obj = ctypes.cast(data_obj_ptr, ctypes.POINTER(IDataObject))
+        get_data_func = ctypes.cast(data_obj.contents.lpVtbl.contents.GetData, ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p, ctypes.POINTER(FORMATETC), ctypes.POINTER(STGMEDIUM)))
+        fmt = FORMATETC()
+        fmt.cfFormat = CF_HDROP
+        fmt.ptd = None
+        fmt.dwAspect = DVASPECT_CONTENT
+        fmt.lindex = -1
+        fmt.tymed = TYMED_HGLOBAL
+        medium = STGMEDIUM()
+        hr = get_data_func(data_obj_ptr, ctypes.byref(fmt), ctypes.byref(medium))
+        if hr != 0:
+            return []
+        try:
+            hdrop = medium.union.hGlobal
+            if not hdrop:
+                return []
+            handle = wintypes.HANDLE(hdrop)
+            results = []
+            count = self.shell32.DragQueryFileW(handle, 0xFFFFFFFF, None, 0)
+            for index in range(count):
+                length = self.shell32.DragQueryFileW(handle, index, None, 0) + 1
+                buffer = ctypes.create_unicode_buffer(length)
+                self.shell32.DragQueryFileW(handle, index, buffer, length)
+                results.append(buffer.value)
+            return results
+        finally:
+            self.ole32.ReleaseStgMedium(ctypes.byref(medium))
+
+    def unregister(self):
+        try:
+            hwnd = self.widget.winfo_id()
+            self.ole32.RevokeDragDrop(wintypes.HWND(hwnd))
+            self.shell32.DragAcceptFiles(wintypes.HWND(hwnd), False)
+        except Exception:
+            logger.exception("Failed to revoke drag-and-drop")
+        if self._ole_initialized:
+            self.ole32.OleUninitialize()
+            self._ole_initialized = False
+
+
+
+class SteamSearchManager:
+    def __init__(self, limit=STEAM_SEARCH_LIMIT, use_popularity=True, ephemeral=True, status_callback=None):
+        self.limit = max(1, int(limit))
+        self.use_popularity = use_popularity
+        self.ephemeral = ephemeral
+        self.status_callback = status_callback
+        self.cache_dir = None
+        self.db_path = None
+        self.ready_event = threading.Event()
+        self.init_error = None
+        self._thread = None
+        self._lock = threading.Lock()
+        self._atexit_handler = None
+        self._closed = False
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._initialize, name="SteamSearchInit", daemon=True)
+        self._thread.start()
+
+    def wait_ready(self, timeout=None):
+        self.ready_event.wait(timeout)
+
+    def search(self, query):
+        if not query:
+            return []
+        self.wait_ready()
+        if self.init_error:
+            raise self.init_error
+        if not self.db_path:
+            return []
+        return self._search_db(self.db_path, query, self.limit, self.use_popularity)
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.wait_ready()
+        if self._atexit_handler:
+            try:
+                atexit.unregister(self._atexit_handler)
+            except Exception:
+                pass
+            self._atexit_handler = None
+        if self.cache_dir:
+            self._delete_cache_dir(self.cache_dir)
+
+    def _initialize(self):
+        self._emit_status("Getting search ready...")
+        try:
+            self.cache_dir = self._cache_dir(self.ephemeral)
+            self.db_path = os.path.join(self.cache_dir, "steam.sqlite")
+            self._register_cleanup()
+            self._prewarm()
+            if not self._closed:
+                self._emit_status("Search ready")
+        except Exception as exc:
+            self.init_error = exc
+            logger.exception("Failed to initialize Steam search cache")
+            self._emit_status("Search unavailable")
+        finally:
+            self.ready_event.set()
+
+    def _emit_status(self, message):
+        if self.status_callback:
+            try:
+                self.status_callback(message)
+            except Exception:
+                logger.exception("Search status callback failed")
+
+    def _register_cleanup(self):
+        if not self.ephemeral or not self.cache_dir:
+            return
+
+        def _cleanup():
+            self._delete_cache_dir(self.cache_dir)
+
+        self._atexit_handler = _cleanup
+        atexit.register(_cleanup)
+
+    def _prewarm(self):
+        if not self._fts5_ok():
+            raise RuntimeError("SQLite FTS5 is required for Steam search but is unavailable in this Python build.")
+        needs_build = (not os.path.exists(self.db_path)) or self._db_age(self.db_path) > TTL_STEAM_SEARCH
+        needs_pop = needs_build or self._db_age(self.db_path) > TTL_STEAMSPY
+        self._rebuild_db(self.db_path, force=needs_build, refresh_popularity=needs_pop)
+
+    def _cache_dir(self, persistent):
+        if not persistent:
+            path = tempfile.mkdtemp(prefix="steam_search_")
+            logger.info("Steam search using ephemeral cache at %s", path)
+            return path
+        base = os.path.join(os.path.expanduser("~"), ".cache", "steam_search_fast")
+        if os.name == "nt":
+            base = os.path.join(os.getenv("LOCALAPPDATA", os.path.expanduser("~")), "steam_search_fast")
+        os.makedirs(base, exist_ok=True)
+        logger.info("Steam search using persistent cache at %s", base)
+        return base
+
+    def _delete_cache_dir(self, path):
+        if not path:
+            return
+        if not os.path.exists(path):
+            logger.info("Steam search cache already removed: %s", path)
+            return
+        last_err = None
+        for attempt in range(1, 6):
+            try:
+                shutil.rmtree(path)
+                logger.info("Steam search cache deleted: %s", path)
+                return
+            except Exception as exc:
+                last_err = exc
+                logger.warning("Attempt %s to delete Steam search cache failed: %s", attempt, exc)
+                time.sleep(0.25 * attempt)
+        logger.error("Unable to delete Steam search cache at %s after retries: %s", path, last_err)
+
+    @staticmethod
+    def _fts5_ok():
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute("CREATE VIRTUAL TABLE t USING fts5(x)")
+            return True
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _db_age(path):
+        if not os.path.exists(path):
+            return float("inf")
+        return time.time() - os.path.getmtime(path)
+
+    def _rebuild_db(self, db_path, force=False, refresh_popularity=False):
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=OFF;")
+            conn.execute("PRAGMA synchronous=OFF;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA page_size=32768;")
+            conn.execute("PRAGMA cache_size=200000;")
+            conn.execute("PRAGMA mmap_size=268435456;")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS apps(
+                    appid INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    name_norm TEXT NOT NULL
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS apps_fts USING fts5(
+                    name_norm, content='apps', content_rowid='appid',
+                    tokenize='unicode61', prefix='2 3 4 5 6'
+                );
+                CREATE TABLE IF NOT EXISTS pop(
+                    appid INTEGER PRIMARY KEY,
+                    owners_mid INTEGER DEFAULT 0,
+                    ccu INTEGER DEFAULT 0,
+                    userscore INTEGER DEFAULT 0,
+                    avg2w INTEGER DEFAULT 0
+                );
+                """
+            )
+            if force:
+                logger.info("Downloading Steam app list for search index")
+                apps = self._fetch_applist()
+                logger.info("Building Steam search index with %s apps", len(apps))
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute("DELETE FROM apps;")
+                conn.execute("DELETE FROM apps_fts;")
+                conn.executemany("INSERT INTO apps(appid,name,name_norm) VALUES(?,?,?)", apps)
+                conn.execute("INSERT INTO apps_fts(rowid,name_norm) SELECT appid,name_norm FROM apps;")
+                conn.execute("COMMIT;")
+            if refresh_popularity:
+                logger.info("Refreshing Steam popularity metrics for search ordering")
+                rows = self._fetch_steamspy_all()
+                conn.execute("BEGIN IMMEDIATE;")
+                conn.execute("DELETE FROM pop;")
+                conn.executemany(
+                    "INSERT OR REPLACE INTO pop(appid,owners_mid,ccu,userscore,avg2w) VALUES(?,?,?,?,?)",
+                    rows,
+                )
+                conn.execute("COMMIT;")
+            conn.execute("PRAGMA optimize;")
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _strip_accents(value):
+        return "".join(ch for ch in unicodedata.normalize("NFKD", value) if not unicodedata.combining(ch))
+
+    def _normalize(self, text):
+        text = self._strip_accents(text or "").lower()
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _fetch_applist(self):
+        payload = request_json(STEAM_APPLIST_URL)
+        apps = payload.get("applist", {}).get("apps", [])
+        result = []
+        for entry in apps:
+            name = (entry.get("name") or "").strip()
+            if not name:
+                continue
+            appid = entry.get("appid")
+            try:
+                app_id_int = int(appid)
+            except (TypeError, ValueError):
+                continue
+            result.append((app_id_int, name, self._normalize(name)))
+        return result
+
+    @staticmethod
+    def _parse_owners_mid(raw):
+        try:
+            lo, hi = [int(part.strip().replace(",", "")) for part in raw.split("..")]
+            return (lo + hi) // 2
+        except Exception:
+            return 0
+
+    def _fetch_steamspy_all(self):
+        data = request_json(STEAMSPY_ALL_URL)
+        rows = []
+        for appid_str, entry in data.items():
+            try:
+                appid = int(entry.get("appid") or appid_str)
+            except Exception:
+                continue
+            rows.append(
+                (
+                    appid,
+                    self._parse_owners_mid(entry.get("owners", "0..0")),
+                    int(entry.get("ccu", 0) or 0),
+                    int(entry.get("userscore", 0) or 0),
+                    int(entry.get("average_2weeks", 0) or 0),
+                )
+            )
+        return rows
+
+    def _fts_match(self, query):
+        normalized = self._normalize(query)
+        if not normalized:
+            return ""
+        tokens = [token for token in normalized.split() if token]
+        return " ".join([f'"{token.replace(chr(34), chr(34) * 2)}"*' for token in tokens])
+
+    def _search_db(self, db_path, query, limit, use_popularity):
+        conn = sqlite3.connect(db_path)
+        try:
+            match = self._fts_match(query)
+            if not match:
+                return []
+            if use_popularity:
+                conn.create_function("log", 1, lambda x: 0.0 if x is None or x <= 0 else math.log(x))
+                pop_expr = (
+                    " (CASE WHEN p.owners_mid>0 THEN log(p.owners_mid+1) ELSE 0 END)"
+                    " + 0.6*(CASE WHEN p.ccu>0 THEN log(p.ccu+1) ELSE 0 END)"
+                    " + 0.2*(COALESCE(p.userscore,0)/100.0)"
+                )
+                sql = f"""
+                    SELECT a.appid, a.name, {pop_expr} AS popscore
+                    FROM apps_fts f
+                    JOIN apps a ON a.appid=f.rowid
+                    LEFT JOIN pop p ON p.appid=a.appid
+                    WHERE apps_fts MATCH ?
+                    ORDER BY popscore DESC, length(a.name) ASC, a.name ASC
+                    LIMIT ?
+                """
+                rows = conn.execute(sql, (match, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                        SELECT a.appid, a.name
+                        FROM apps_fts f
+                        JOIN apps a ON a.appid=f.rowid
+                        WHERE apps_fts MATCH ?
+                        ORDER BY length(a.name) ASC, a.name ASC
+                        LIMIT ?
+                    """,
+                    (match, limit),
+                ).fetchall()
+            if not rows:
+                like = f"%{self._normalize(query)}%"
+                rows = conn.execute(
+                    "SELECT appid, name FROM apps WHERE name_norm LIKE ? ORDER BY length(name), name LIMIT ?",
+                    (like, limit),
+                ).fetchall()
+            results = []
+            for row in rows:
+                appid, name = row[0], row[1]
+                results.append((str(appid), name.strip()))
+            return results
+        finally:
+            conn.close()
 
 def _import_steam_client():
     try:
@@ -1019,6 +1620,7 @@ class SteamDepotApp:
         self.root.update_idletasks()
         self.root.geometry("1080x640")
         self.root.minsize(980, 560)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         ensure_icon(self.root)
         self.create_background()
         self.queue = queue.Queue()
@@ -1026,6 +1628,11 @@ class SteamDepotApp:
         self.search_after_id = None
         self.status_var = tk.StringVar(value=STATUS_IDLE)
         self.download_log_var = tk.StringVar(value="")
+        self.search_manager = SteamSearchManager(
+            limit=STEAM_SEARCH_LIMIT,
+            status_callback=self.handle_search_status,
+        )
+        self.handle_search_status("Getting search ready...")
         self.repos = read_repos(Path("repos.txt"))
         self.repo_objects = {identifier: ManifestRepo(identifier) for identifier in self.repos}
         self.store = LocalStore("added_games.json")
@@ -1037,9 +1644,22 @@ class SteamDepotApp:
         self.search_entry = None
         self.search_placeholder_active = False
         self.active_search = None
+        self.drop_zone_default_text = "Drop .zip file here"
+        self.drop_zone_hint_text = "Drag a .zip archive onto this window to import locally"
+        self._drop_zone_reset_job = None
+        self.import_in_progress = False
+        self.drop_overlay = None
+        self.drop_overlay_inner = None
+        self.drop_overlay_icon = None
+        self.drop_overlay_label = None
+        self.drop_overlay_hint = None
+        self.drop_overlay_visible = False
         self.setup_style()
         self.build_gui()
+        self.set_drop_zone_state("idle")
         self.refresh_added()
+        self.setup_drag_and_drop()
+        self.search_manager.start()
         self.root.after(150, self.process_queue)
 
     def create_background(self):
@@ -1341,6 +1961,7 @@ class SteamDepotApp:
         self.results_tree.configure(yscrollcommand=self.result_scroll.set)
         self.results_tree.bind("<Double-1>", self.on_add_double_click)
         self.apply_tree_tags(self.results_tree)
+        self.create_drop_overlay()
         add_frame = ttk.Frame(right, style="Panel.TFrame")
         add_frame.grid(row=2, column=0, sticky="ew", pady=(16, 0))
         add_frame.grid_columnconfigure(0, weight=1)
@@ -1363,10 +1984,198 @@ class SteamDepotApp:
         self.root.geometry(f"{required_width}x{required_height}")
         self.root.minsize(required_width, required_height)
 
+    def create_drop_overlay(self):
+        self.drop_overlay = tk.Frame(self.root, bg="#102136", highlightthickness=2, highlightbackground="#225c8d")
+        self.drop_overlay.place_forget()
+        self.drop_overlay_inner = tk.Frame(self.drop_overlay, bg="#102136")
+        self.drop_overlay_inner.place(relx=0.5, rely=0.5, anchor="center")
+        self.drop_overlay_icon = tk.Canvas(self.drop_overlay_inner, width=48, height=48, bg="#102136", highlightthickness=0)
+        self.drop_overlay_icon.grid(row=0, column=0, pady=(0, 8))
+        self._draw_drop_icon(self.drop_overlay_icon, "#4a7fb5")
+        self.drop_overlay_label = tk.Label(
+            self.drop_overlay_inner,
+            text=self.drop_zone_default_text,
+            font=("Segoe UI Semibold", 12),
+            fg="#c5e2ff",
+            bg="#102136",
+        )
+        self.drop_overlay_label.grid(row=1, column=0)
+        self.drop_overlay_hint = tk.Label(
+            self.drop_overlay_inner,
+            text=self.drop_zone_hint_text,
+            font=("Segoe UI", 10),
+            fg="#7ca6c7",
+            bg="#102136",
+        )
+        self.drop_overlay_hint.grid(row=2, column=0, pady=(4, 0))
+        self.drop_overlay.lift()
+        self.set_drop_zone_state("idle")
+
     def apply_tree_tags(self, tree):
         tree.tag_configure("even", background="#142233", foreground="#d6e6ff")
         tree.tag_configure("odd", background="#122030", foreground="#c9dbf8")
         tree.tag_configure("header", font=("Segoe UI Semibold", 10))
+
+    def _draw_drop_icon(self, canvas, color):
+        canvas.delete("icon")
+        canvas.create_polygon(
+            12,
+            16,
+            24,
+            8,
+            36,
+            16,
+            36,
+            36,
+            12,
+            36,
+            outline=color,
+            fill="",
+            width=2,
+            tags="icon",
+        )
+        canvas.create_line(12, 22, 36, 22, fill=color, width=2, tags="icon")
+        canvas.create_rectangle(18, 26, 30, 36, outline=color, width=2, tags="icon")
+
+    def set_drop_zone_state(self, state, message=None, transient=False):
+        if not self.drop_overlay:
+            return
+        if self._drop_zone_reset_job:
+            self.root.after_cancel(self._drop_zone_reset_job)
+            self._drop_zone_reset_job = None
+        if state == "idle":
+            if not self.import_in_progress and self.drop_overlay_visible:
+                self.drop_overlay.place_forget()
+                self.drop_overlay_visible = False
+            return
+        palettes = {
+            "active": ("#15314a", "#3a8ee6", "#6fb0f5"),
+            "success": ("#123824", "#2f9d65", "#69d49d"),
+            "error": ("#341b1f", "#c15a5a", "#e38e8e"),
+        }
+        bg, border, icon_color = palettes.get(state, ("#102136", "#225c8d", "#4a7fb5"))
+        if not self.drop_overlay_visible:
+            self.drop_overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self.drop_overlay_visible = True
+        self.drop_overlay.lift()
+        self.drop_overlay.configure(bg=bg, highlightbackground=border)
+        self.drop_overlay_inner.configure(bg=bg)
+        self.drop_overlay_icon.configure(bg=bg)
+        self.drop_overlay_label.configure(bg=bg, text=message or self.drop_zone_default_text)
+        self.drop_overlay_hint.configure(bg=bg, text=self.drop_zone_hint_text)
+        self._draw_drop_icon(self.drop_overlay_icon, icon_color)
+        if transient:
+            self._drop_zone_reset_job = self.root.after(2000, lambda: self.set_drop_zone_state("idle"))
+
+    def setup_drag_and_drop(self):
+        self.drop_target = None
+        if os.name == "nt":
+            try:
+                self.drop_target = WindowsZipDropTarget(
+                    self.root,
+                    self.queue,
+                )
+            except Exception:
+                logger.exception("Failed to initialize drag-and-drop")
+
+    def infer_app_name_from_zip(self, lua_files, zip_path):
+        for lua_file in lua_files:
+            try:
+                content = lua_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            match = re.search(r'appname\s*=\s*"([^\"]+)"', content, re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate:
+                    return candidate
+            match = re.search(r'addappid\(\s*\d+\s*,\s*\d+\s*,\s*"([^\"]+)"', content, re.IGNORECASE)
+            if match:
+                candidate = match.group(1).strip()
+                if candidate and not candidate.lower().startswith("0x"):
+                    return candidate
+        stem = zip_path.stem.strip().replace("_", " ").replace("-", " ")
+        return stem or None
+
+    def start_zip_import(self, zip_path):
+        zip_path = Path(zip_path)
+        if not zip_path.exists():
+            message = f"{zip_path.name} not found."
+            self.set_download_log(message)
+            self.set_drop_zone_state("error", message, transient=True)
+            return
+        if self.import_in_progress:
+            message = "Import already in progress."
+            self.set_download_log(message)
+            self.set_drop_zone_state("active", message)
+            return
+        self.import_in_progress = True
+        self.status_var.set(f"Importing {zip_path.stem} from zip...")
+        self.set_download_log(f"Importing {zip_path.name}")
+        self.set_drop_zone_state("active", f"Importing {zip_path.name}")
+        thread = threading.Thread(target=self.zip_import_worker, args=(zip_path,), daemon=True)
+        thread.start()
+
+    def zip_import_worker(self, zip_path):
+        temp_dir = Path(tempfile.mkdtemp(prefix="steam_zip_import_"))
+        try:
+            try:
+                with zipfile.ZipFile(zip_path) as archive:
+                    archive.extractall(temp_dir)
+            except Exception as exc:
+                logger.exception("Failed to extract %s", zip_path)
+                self.queue.put(("zip_error", zip_path.name, f"Failed to extract {zip_path.name}: {exc}"))
+                return
+            extracted_files = [path for path in temp_dir.rglob("*") if path.is_file()]
+            lua_files = [path for path in extracted_files if path.suffix.lower() == ".lua"]
+            manifest_files = [path for path in extracted_files if path.suffix.lower() == ".manifest"]
+            key_files = [path for path in extracted_files if path.suffix.lower() == ".key"]
+            missing = []
+            if not lua_files:
+                missing.append(".lua")
+            if not manifest_files:
+                missing.append(".manifest")
+            if missing:
+                message = f"{zip_path.name}: missing {' and '.join(missing)} file(s)"
+                self.queue.put(("zip_error", zip_path.name, message))
+                return
+            app_ids = sorted({ "".join(ch for ch in path.stem if ch.isdigit()) for path in lua_files })
+            app_ids = [appid for appid in app_ids if appid]
+            if not app_ids:
+                self.queue.put(("zip_error", zip_path.name, f"{zip_path.name}: unable to determine app ID"))
+                return
+            if len(app_ids) > 1:
+                self.queue.put(("zip_error", zip_path.name, f"{zip_path.name}: multiple app IDs detected ({', '.join(app_ids)})"))
+                return
+            appid = app_ids[0]
+            app_name = self.resolve_app_name(appid)
+            if not app_name or app_name == f"App {appid}":
+                derived = self.infer_app_name_from_zip(lua_files, zip_path)
+                if derived:
+                    app_name = derived
+            allowed_depots = sorted({
+                manifest.stem.split("_", 1)[0]
+                for manifest in manifest_files
+                if "_" in manifest.stem and manifest.stem.split("_", 1)[0].isdigit()
+            })
+            files_to_apply = lua_files + key_files + manifest_files
+            manifest_files_moved, depot_keys, applist_files, rename_map = self.integrator.apply(
+                appid,
+                app_name,
+                files_to_apply,
+                allowed_depots=allowed_depots,
+                progress_callback=self.set_download_log,
+            )
+            if rename_map:
+                self.store.update_applist_files(rename_map)
+            repo_id = f"local_zip/{zip_path.stem}"
+            self.store.add(repo_id, appid, app_name, manifest_files_moved, depot_keys, applist_files)
+            self.queue.put(("zip_success", zip_path.name, appid, app_name))
+        except Exception as exc:
+            logger.exception("Unexpected error while importing %s", zip_path)
+            self.queue.put(("zip_error", zip_path.name, f"Failed to import {zip_path.name}: {exc}"))
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def choose_steam_folder(self):
         folder = filedialog.askdirectory(title="Select Steam Folder", initialdir=self.steam_folder_var.get())
@@ -1469,22 +2278,15 @@ class SteamDepotApp:
                         if not repo.branch_exists(appid):
                             logger.info("Repo %s has no branch for app id %s", repo_id, appid)
                             continue
-                        paths = repo.fetch_manifest_paths(appid)
                     except Exception:
                         logger.exception("Failed to inspect repo %s for app %s", repo_id, appid)
                         continue
-                    if paths:
-                        repos.append({"repo": repo_id, "branch": appid, "paths": paths})
-                        logger.info(
-                            "Found manifest paths for app %s in repo %s: %s",
-                            appid,
-                            repo_id,
-                            ", ".join(paths),
-                        )
+                    repos.append({"repo": repo_id, "branch": appid})
+                    logger.info("Repo %s has branch for app %s", repo_id, appid)
                 if repos:
                     results.append({"appid": appid, "name": name, "repos": repos})
                     logger.info(
-                        "Found app id %s (%s) with repos: %s",
+                        "Found app id %s (%s) with repos (branch only): %s",
                         appid,
                         name,
                         ", ".join(repo_entry["repo"] for repo_entry in repos),
@@ -1498,14 +2300,11 @@ class SteamDepotApp:
                 logger.info("Searching repositories for app id %s (%s)", appid, name)
                 inspect_app(appid, name)
             else:
-                logger.info("Searching for apps matching '%s'", normalized)
-                url = f"https://steamcommunity.com/actions/SearchApps/{urllib.parse.quote(normalized)}"
-                data = request_json(url)
-                for entry in data:
-                    appid = str(entry.get("appid", "")).strip()
-                    name = entry.get("name", "").strip()
-                    if not appid or not name:
-                        continue
+                logger.info("Searching Steam index for '%s'", normalized)
+                hits = self.search_manager.search(normalized)
+                if not hits:
+                    logger.info("No Steam search hits for '%s'", normalized)
+                for appid, name in hits:
                     inspect_app(appid, name)
 
             self.queue.put(("search_results", query, results))
@@ -1760,7 +2559,26 @@ class SteamDepotApp:
             while True:
                 item = self.queue.get_nowait()
                 kind = item[0]
-                if kind == "search_results":
+                if kind == "drop_hover":
+                    _, active = item
+                    if not self.import_in_progress:
+                        if active:
+                            self.set_drop_zone_state("active")
+                        else:
+                            self.set_drop_zone_state("idle")
+                elif kind == "drop_zip":
+                    _, path_value = item
+                    if path_value:
+                        if self.import_in_progress:
+                            self.set_download_log("Import already in progress.")
+                            self.set_drop_zone_state("active", "Import already in progress")
+                        else:
+                            self.start_zip_import(Path(path_value))
+                    else:
+                        message = "Only .zip files are supported."
+                        self.set_download_log(message)
+                        self.set_drop_zone_state("error", message, transient=True)
+                elif kind == "search_results":
                     _, query, results = item
                     if query != self.search_var.get().strip():
                         continue
@@ -1774,15 +2592,37 @@ class SteamDepotApp:
                         _, _, repo_id, appid, name = item
                         self.refresh_added()
                         self.status_var.set(f"{name} added.")
-                        self.set_download_log(f"Finished {appid}")
+                        self.set_download_log(f"Finished {name} ({appid})")
                     else:
                         _, _, message = item
                         self.status_var.set(STATUS_IDLE)
                         self.set_download_log("Download failed")
                         messagebox.showerror("Download Failed", message, parent=self.root)
+                elif kind == "zip_success":
+                    _, zip_name, appid, name = item
+                    self.import_in_progress = False
+                    self.refresh_added()
+                    self.status_var.set(f"{name} imported.")
+                    self.set_download_log(f"Imported {name} ({appid})")
+                    self.set_drop_zone_state("success", f"Imported {name}", transient=True)
+                elif kind == "zip_error":
+                    _, zip_name, message = item
+                    self.import_in_progress = False
+                    self.status_var.set(STATUS_IDLE)
+                    self.set_download_log(message)
+                    self.set_drop_zone_state("error", message, transient=True)
         except queue.Empty:
             pass
         self.root.after(150, self.process_queue)
+
+    def handle_search_status(self, message):
+        logger.info("Search status: %s", message)
+        def update():
+            self.download_log_var.set(message)
+        if threading.current_thread() is threading.main_thread():
+            update()
+        else:
+            self.root.after(0, update)
 
     def set_download_log(self, message):
         logger.info("Progress: %s", message)
@@ -1818,6 +2658,20 @@ class SteamDepotApp:
         else:
             self.status_var.set("No results found.")
 
+    def on_close(self):
+        try:
+            if getattr(self, "drop_target", None):
+                self.drop_target.unregister()
+        except Exception:
+            logger.exception("Error while releasing drop target")
+        try:
+            if getattr(self, "search_manager", None):
+                self.search_manager.close()
+        except Exception:
+            logger.exception("Error while shutting down search manager")
+        finally:
+            self.root.destroy()
+
     def run(self):
         self.root.mainloop()
 
@@ -1829,4 +2683,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
