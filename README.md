@@ -27,9 +27,9 @@ https://github.com/user-attachments/assets/fb9c10b4-a5da-4b4a-8ca7-aab64e63e120
 
 ## Getting Started
 1. Clone or extract the project.
-2. Edit `repos.txt` to list every GitHub repository that hosts Lua/manifest files (one `owner/repo` per line).
-3. Launch the app with `python steam_depot_gui.py` (or run the packaged executable) and confirm the detected Steam folder, updating it if necessary.
-4. Search by game name or app ID, select the repository branch result, and click **Add Selected** to download and integrate the manifests.
+2. Launch the app with `python steam_depot_gui.py` (or run the packaged executable) and confirm the detected Steam folder, updating it if necessary.
+3. Search by game name or app ID, select the repository branch result, and click **Add Selected** to download and integrate the manifests.
+4. (Optional) Edit the `repos.txt` file to add any GitHub repository you want that hosts Lua/manifest files (one `owner/repo` per line).
 5. (Optional) Drag a `.zip` archive onto the window to import a prepared package; the UI will confirm success and log any missing files.
 
 ## Troubleshooting
