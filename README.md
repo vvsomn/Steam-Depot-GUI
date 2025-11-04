@@ -2,8 +2,6 @@
 
 Steam Depot GUI helps you catalogue, download, and organize Steam depot manifests inside a Green Luma-preconfigured Steam installation. It streamlines manifest discovery across community repositories, automates common Green Luma file-management steps, and keeps your personal collection tidy with a modern, status-rich interface.
 
-This project is intended for maintaining legitimate backups of titles you own. It does not ship or endorse any tools that interfere with Steam licensing.
-
 ## Showcase
 
 https://github.com/user-attachments/assets/fb9c10b4-a5da-4b4a-8ca7-aab64e63e120
